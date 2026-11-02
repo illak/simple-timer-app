@@ -7,9 +7,10 @@
 <script>
   // Aplica el tema antes de pintar para evitar parpadeo
   (function () {
-    var t = localStorage.getItem('theme') ||
+    var t = null;
+    try { t = localStorage.getItem('theme'); } catch (e) {}
+    document.documentElement.dataset.theme = t ||
       (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-    document.documentElement.dataset.theme = t;
   })();
 </script>
 <style>
@@ -122,8 +123,19 @@
   let state = 'idle';        // idle | running | paused | done
   let remainingMs = 0;       // válido en paused/idle
   let endTime = 0;           // timestamp de fin cuando está running
-  let tickId = null;
   let lastBeepSec = null;
+
+  // Los timers normales se frenan en pestañas ocultas (hasta 1 vez por minuto),
+  // lo que retrasaría la bocina. Un Worker no sufre esa limitación.
+  let worker = null, fallbackId = null;
+  try {
+    worker = new Worker(URL.createObjectURL(new Blob(
+      ['let id=null;onmessage=e=>{clearInterval(id);if(e.data==="start")id=setInterval(()=>postMessage(0),100)}'],
+      { type: 'text/javascript' })));
+    worker.onmessage = () => tick();
+  } catch (e) { worker = null; }
+  const startTicking = () => worker ? worker.postMessage('start') : (fallbackId = setInterval(tick, 100));
+  const stopTicking = () => worker ? worker.postMessage('stop') : clearInterval(fallbackId);
 
   // ---- Persistencia de ajustes ----
   try {
@@ -132,8 +144,12 @@
     if (s.warn != null) warnIn.value = s.warn;
     if (s.sound != null) soundIn.checked = s.sound;
   } catch (e) {}
-  const saveSettings = () => localStorage.setItem('settings',
-    JSON.stringify({ total: totalIn.value, warn: warnIn.value, sound: soundIn.checked }));
+  const saveSettings = () => {
+    try {
+      localStorage.setItem('settings',
+        JSON.stringify({ total: totalIn.value, warn: warnIn.value, sound: soundIn.checked }));
+    } catch (e) {}
+  };
 
   const totalMs = () => Math.max(1, Math.floor(+totalIn.value || 1)) * 60000;
   const warnMs = () => Math.max(0, Math.floor(+warnIn.value || 0)) * 60000;
@@ -164,8 +180,8 @@
     const c = audio(), t = c.currentTime, dur = 2.2;
     const master = c.createGain();
     master.gain.setValueAtTime(0.0001, t);
-    master.gain.exponentialRampToValueAtTime(0.5, t + 0.03);
-    master.gain.setValueAtTime(0.5, t + dur - 0.35);
+    master.gain.exponentialRampToValueAtTime(0.12, t + 0.03); // 8 osciladores: evita saturar
+    master.gain.setValueAtTime(0.12, t + dur - 0.35);
     master.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     const lp = c.createBiquadFilter();
     lp.type = 'lowpass'; lp.frequency.value = 3500;
@@ -204,13 +220,16 @@
   function setState(s) {
     state = s;
     startBtn.textContent = s === 'running' ? 'Pausar' : s === 'paused' ? 'Continuar' : 'Iniciar';
-    $('settings').classList.toggle('locked', s === 'running' || s === 'paused');
+    const locked = s === 'running' || s === 'paused';
+    $('settings').classList.toggle('locked', locked);
+    totalIn.disabled = warnIn.disabled = locked; // también bloquea el teclado
     statusEl.textContent = { idle: 'Listo', running: 'En marcha', paused: 'En pausa', done: '¡Tiempo!' }[s];
   }
 
   // ---- Lógica ----
   function tick() {
-    const left = Math.max(0, endTime - performance.now());
+    if (state !== 'running') return;
+    const left = Math.max(0, endTime - Date.now());
     render(left);
 
     const inWarn = warnMs() > 0 && left <= warnMs() && left > 0;
@@ -221,14 +240,14 @@
       if (sec !== lastBeepSec) { lastBeepSec = sec; beep(); }
     }
 
-    if (left === 0) { finish(); return; }
-    tickId = setTimeout(tick, 100);
+    if (left === 0) finish();
   }
 
   function finish() {
-    clearTimeout(tickId);
+    stopTicking();
     remainingMs = 0;
     setState('done');
+    render(0);
     setWarning(true);
     document.body.classList.add('pulse');
     airhorn();
@@ -238,23 +257,24 @@
   function start() {
     audio(); // desbloquea el audio con el gesto del usuario
     if (state === 'idle' || state === 'done') remainingMs = totalMs();
-    endTime = performance.now() + remainingMs;
+    endTime = Date.now() + remainingMs;
     lastBeepSec = null;
     setState('running');
     requestWake();
     tick();
+    startTicking();
   }
 
   function pause() {
-    clearTimeout(tickId);
-    remainingMs = Math.max(0, endTime - performance.now());
+    stopTicking();
+    remainingMs = Math.max(0, endTime - Date.now());
     setState('paused');
     document.body.classList.remove('pulse');
     releaseWake();
   }
 
   function reset() {
-    clearTimeout(tickId);
+    stopTicking();
     setState('idle');
     setWarning(false);
     remainingMs = totalMs();
@@ -266,7 +286,9 @@
   resetBtn.onclick = reset;
   // La alerta debe ser menor que el tiempo total
   function clampWarn() {
-    const total = Math.max(1, Math.floor(+totalIn.value || 1));
+    // Normaliza el total: vacío, decimales o fuera de rango
+    const total = Math.min(999, Math.max(1, Math.floor(+totalIn.value || 1)));
+    totalIn.value = total;
     const max = total - 1;
     warnIn.max = max;
     const w = Math.max(0, Math.floor(+warnIn.value || 0));
@@ -286,8 +308,11 @@
 
   // Atajos: espacio = iniciar/pausar, R = reiniciar, T = tema, F = pantalla completa
   document.addEventListener('keydown', e => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
-    if (e.code === 'Space') { e.preventDefault(); startBtn.click(); }
+    if (e.target.tagName === 'INPUT') return;
+    if (e.code === 'Space' || e.key === 'Enter') {
+      if (e.target.tagName === 'BUTTON') return; // el botón enfocado ya reacciona solo
+      e.preventDefault(); startBtn.click();
+    }
     else if (e.key === 'r' || e.key === 'R') reset();
     else if (e.key === 't' || e.key === 'T') $('theme').click();
     else if (e.key === 'f' || e.key === 'F') $('fullscreen').click();
@@ -297,7 +322,7 @@
   $('theme').onclick = () => {
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = next;
-    localStorage.setItem('theme', next);
+    try { localStorage.setItem('theme', next); } catch (e) {}
   };
 
   // ---- Pantalla completa y pantalla encendida ----
@@ -306,7 +331,14 @@
     else document.documentElement.requestFullscreen?.();
   };
   let wake = null;
-  async function requestWake() { try { wake = await navigator.wakeLock?.request('screen'); } catch (e) {} }
+  async function requestWake() {
+    try {
+      releaseWake();
+      const lock = await navigator.wakeLock?.request('screen');
+      if (!lock) return;
+      if (state === 'running') wake = lock; else lock.release().catch(() => {}); // terminó mientras se pedía
+    } catch (e) {}
+  }
   function releaseWake() { wake?.release?.().catch(() => {}); wake = null; }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && state === 'running') requestWake();
