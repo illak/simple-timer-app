@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temporizador</title>
+<script>
+  // Aplica el tema antes de pintar para evitar parpadeo
+  (function () {
+    var t = localStorage.getItem('theme') ||
+      (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<style>
+  :root {
+    --bg: #f4f5f7; --fg: #14181f; --muted: #6b7280; --card: #ffffff;
+    --border: #d9dde3; --accent: #1f9d55; --danger: #e02424; --btn: #e8eaee;
+  }
+  [data-theme="dark"] {
+    --bg: #0b0d10; --fg: #e8ecf1; --muted: #8b95a3; --card: #14181d;
+    --border: #262c34; --accent: #34d37a; --danger: #ff4d4d; --btn: #1d2229;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; transition: background .3s, color .3s;
+  }
+  body.warning { background: var(--danger); color: #fff; }
+  body.warning.pulse { animation: pulse 1s steps(1) infinite; }
+  @keyframes pulse { 50% { background: #7a0f0f; } }
+
+  header { display: flex; justify-content: flex-end; gap: .5rem; padding: .75rem 1rem; }
+  .icon-btn {
+    background: var(--btn); color: inherit; border: 1px solid var(--border);
+    border-radius: 10px; padding: .5rem .75rem; font-size: 1rem; cursor: pointer;
+  }
+  body.warning .icon-btn { background: rgba(0,0,0,.25); border-color: rgba(255,255,255,.4); }
+
+  main {
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 2rem; padding: 1rem;
+  }
+  #display {
+    font-family: ui-monospace, "SF Mono", "DejaVu Sans Mono", Consolas, monospace;
+    font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .02em;
+    font-size: clamp(4rem, 26vw, 22rem); line-height: 1; margin: 0;
+    text-shadow: 0 0 .15em color-mix(in srgb, currentColor 35%, transparent);
+  }
+  #status { color: var(--muted); font-size: 1.1rem; min-height: 1.4em; margin: 0; }
+  body.warning #status { color: #fff; }
+
+  .controls { display: flex; gap: .75rem; flex-wrap: wrap; justify-content: center; }
+  .controls button {
+    font-size: 1.3rem; padding: .8rem 2rem; border-radius: 12px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--btn); color: inherit; min-width: 8rem;
+  }
+  .controls button.primary { background: var(--accent); color: #fff; border-color: transparent; font-weight: 600; }
+  body.warning .controls button { border-color: rgba(255,255,255,.5); }
+  body.warning .controls button:not(.primary) { background: rgba(0,0,0,.25); }
+
+  .settings {
+    display: flex; gap: 1.25rem; flex-wrap: wrap; justify-content: center;
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 1rem 1.25rem; color: var(--fg);
+  }
+  .settings label { display: flex; flex-direction: column; gap: .3rem; font-size: .85rem; color: var(--muted); }
+  .settings input[type=number] {
+    width: 7rem; font-size: 1.3rem; padding: .4rem .6rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  }
+  .settings label.check { flex-direction: row; align-items: center; gap: .5rem; align-self: end; padding-bottom: .5rem; }
+  #warn-note { margin: -1rem 0 0; min-height: 1.2em; font-size: .9rem; color: var(--muted); }
+  body.warning #warn-note { color: #fff; }
+  .settings.locked { opacity: .5; pointer-events: none; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  body.warning button:focus-visible { outline-color: #fff; }
+</style>
+</head>
+<body>
+  <header>
+    <button class="icon-btn" id="fullscreen" title="Pantalla completa" aria-label="Pantalla completa">⛶</button>
+    <button class="icon-btn" id="theme" title="Cambiar tema" aria-label="Cambiar tema claro/oscuro">🌓</button>
+  </header>
+
+  <main>
+    <div>
+      <h1 id="display" role="timer" aria-live="off">15:00</h1>
+    </div>
+    <p id="status">Listo</p>
+
+    <div class="controls">
+      <button class="primary" id="start">Iniciar</button>
+      <button id="reset">Reiniciar</button>
+    </div>
+
+    <div class="settings" id="settings">
+      <label>Tiempo total (min)
+        <input type="number" id="total" min="1" max="999" step="1" value="15">
+      </label>
+      <label>Alerta a los (min restantes)
+        <input type="number" id="warn" min="0" max="999" step="1" value="3">
+      </label>
+      <label class="check">
+        <input type="checkbox" id="sound" checked> Sonido
+      </label>
+    </div>
+    <p id="warn-note" role="status"></p>
+  </main>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const display = $('display'), statusEl = $('status');
+  const startBtn = $('start'), resetBtn = $('reset');
+  const totalIn = $('total'), warnIn = $('warn'), soundIn = $('sound');
+  const warnNote = $('warn-note');
+
+  // ---- Estado ----
+  let state = 'idle';        // idle | running | paused | done
+  let remainingMs = 0;       // válido en paused/idle
+  let endTime = 0;           // timestamp de fin cuando está running
+  let tickId = null;
+  let lastBeepSec = null;
+
+  // ---- Persistencia de ajustes ----
+  try {
+    const s = JSON.parse(localStorage.getItem('settings') || '{}');
+    if (s.total) totalIn.value = s.total;
+    if (s.warn != null) warnIn.value = s.warn;
+    if (s.sound != null) soundIn.checked = s.sound;
+  } catch (e) {}
+  const saveSettings = () => localStorage.setItem('settings',
+    JSON.stringify({ total: totalIn.value, warn: warnIn.value, sound: soundIn.checked }));
+
+  const totalMs = () => Math.max(1, Math.floor(+totalIn.value || 1)) * 60000;
+  const warnMs = () => Math.max(0, Math.floor(+warnIn.value || 0)) * 60000;
+
+  // ---- Audio (Web Audio, sin archivos externos) ----
+  let ctx = null;
+  function audio() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  }
+
+  function beep() {
+    if (!soundIn.checked) return;
+    const c = audio(), t = c.currentTime;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = 'square'; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+    o.connect(g).connect(c.destination);
+    o.start(t); o.stop(t + 0.17);
+  }
+
+  // Airhorn: acorde de dientes de sierra desafinados con ligera caída de tono
+  function airhorn() {
+    if (!soundIn.checked) return;
+    const c = audio(), t = c.currentTime, dur = 2.2;
+    const master = c.createGain();
+    master.gain.setValueAtTime(0.0001, t);
+    master.gain.exponentialRampToValueAtTime(0.5, t + 0.03);
+    master.gain.setValueAtTime(0.5, t + dur - 0.35);
+    master.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    const lp = c.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 3500;
+    master.connect(lp).connect(c.destination);
+
+    [415, 523, 622, 830].forEach((f, i) => {
+      [-6, 6].forEach(detune => {
+        const o = c.createOscillator();
+        o.type = 'sawtooth';
+        o.frequency.setValueAtTime(f * 1.04, t);
+        o.frequency.exponentialRampToValueAtTime(f, t + 0.12);
+        o.detune.value = detune + i;
+        o.connect(master);
+        o.start(t); o.stop(t + dur);
+      });
+    });
+  }
+
+  // ---- Presentación ----
+  function fmt(ms) {
+    const s = Math.ceil(ms / 1000);
+    const m = Math.floor(s / 60), r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+  }
+
+  function render(ms) {
+    display.textContent = fmt(ms);
+    document.title = (state === 'running' ? fmt(ms) + ' · ' : '') + 'Temporizador';
+  }
+
+  function setWarning(on) {
+    document.body.classList.toggle('warning', on);
+    document.body.classList.toggle('pulse', on && state === 'running');
+  }
+
+  function setState(s) {
+    state = s;
+    startBtn.textContent = s === 'running' ? 'Pausar' : s === 'paused' ? 'Continuar' : 'Iniciar';
+    $('settings').classList.toggle('locked', s === 'running' || s === 'paused');
+    statusEl.textContent = { idle: 'Listo', running: 'En marcha', paused: 'En pausa', done: '¡Tiempo!' }[s];
+  }
+
+  // ---- Lógica ----
+  function tick() {
+    const left = Math.max(0, endTime - performance.now());
+    render(left);
+
+    const inWarn = warnMs() > 0 && left <= warnMs() && left > 0;
+    setWarning(inWarn || left === 0);
+    if (inWarn) {
+      statusEl.textContent = '⚠ Quedan ' + fmt(left);
+      const sec = Math.ceil(left / 1000);
+      if (sec !== lastBeepSec) { lastBeepSec = sec; beep(); }
+    }
+
+    if (left === 0) { finish(); return; }
+    tickId = setTimeout(tick, 100);
+  }
+
+  function finish() {
+    clearTimeout(tickId);
+    remainingMs = 0;
+    setState('done');
+    setWarning(true);
+    document.body.classList.add('pulse');
+    airhorn();
+    releaseWake();
+  }
+
+  function start() {
+    audio(); // desbloquea el audio con el gesto del usuario
+    if (state === 'idle' || state === 'done') remainingMs = totalMs();
+    endTime = performance.now() + remainingMs;
+    lastBeepSec = null;
+    setState('running');
+    requestWake();
+    tick();
+  }
+
+  function pause() {
+    clearTimeout(tickId);
+    remainingMs = Math.max(0, endTime - performance.now());
+    setState('paused');
+    document.body.classList.remove('pulse');
+    releaseWake();
+  }
+
+  function reset() {
+    clearTimeout(tickId);
+    setState('idle');
+    setWarning(false);
+    remainingMs = totalMs();
+    render(remainingMs);
+    releaseWake();
+  }
+
+  startBtn.onclick = () => (state === 'running' ? pause() : start());
+  resetBtn.onclick = reset;
+  // La alerta debe ser menor que el tiempo total
+  function clampWarn() {
+    const total = Math.max(1, Math.floor(+totalIn.value || 1));
+    const max = total - 1;
+    warnIn.max = max;
+    const w = Math.max(0, Math.floor(+warnIn.value || 0));
+    if (w > max) {
+      warnIn.value = max;
+      warnNote.textContent = 'La alerta debe ser menor al tiempo total; se ajustó a ' + max + ' min.';
+    } else {
+      warnNote.textContent = '';
+    }
+  }
+
+  [totalIn, warnIn, soundIn].forEach(el => el.addEventListener('change', () => {
+    clampWarn();
+    saveSettings();
+    if (state === 'idle' || state === 'done') reset();
+  }));
+
+  // Atajos: espacio = iniciar/pausar, R = reiniciar, T = tema, F = pantalla completa
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+    if (e.code === 'Space') { e.preventDefault(); startBtn.click(); }
+    else if (e.key === 'r' || e.key === 'R') reset();
+    else if (e.key === 't' || e.key === 'T') $('theme').click();
+    else if (e.key === 'f' || e.key === 'F') $('fullscreen').click();
+  });
+
+  // ---- Tema ----
+  $('theme').onclick = () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('theme', next);
+  };
+
+  // ---- Pantalla completa y pantalla encendida ----
+  $('fullscreen').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.();
+  };
+  let wake = null;
+  async function requestWake() { try { wake = await navigator.wakeLock?.request('screen'); } catch (e) {} }
+  function releaseWake() { wake?.release?.().catch(() => {}); wake = null; }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state === 'running') requestWake();
+  });
+
+  clampWarn();
+  warnNote.textContent = '';
+  reset();
+})();
+</script>
+</body>
+</html>
